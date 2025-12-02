@@ -1,0 +1,21 @@
+# Large raw dataset from ClinicalTrials.gov (≈11 GB)
+ctg-public-xml/
+
+# Derived data exports
+data/all_xml
+data/trials_summary*.ndjson
+data/*.csv
+data/*.parquet
+
+# Notebook execution artifacts
+*.ipynb_checkpoints/
+
+# Model artifacts / logs
+models/
+logs/
+
+# macOS / editor cruft
+.DS_Store
+.idea/
+.vscode/
+
