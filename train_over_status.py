@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 from typing import Iterable
 
+import matplotlib.pyplot as plt
+plt.switch_backend("Agg")
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
@@ -15,7 +17,7 @@ from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, roc_curve
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -179,10 +181,99 @@ def _resolve_test_size(
     return resolved, stratify
 
 
-def train_and_eval(data_path: Path, test_size: float | int, random_state: int, save_model: Path | None) -> None:
+def _save_classification_reports(reports: dict[str, dict], output_dir: Path) -> None:
+    """Persist classification reports to JSON and CSV."""
+    report_path = output_dir / "classification_reports.json"
+    with report_path.open("w", encoding="utf-8") as fh:
+        json.dump(reports, fh, indent=2)
+
+    rows: list[dict[str, float | str]] = []
+    for model_name, report in reports.items():
+        for label, metrics in report.items():
+            if isinstance(metrics, dict):
+                rows.append(
+                    {
+                        "model": model_name,
+                        "label": label,
+                        "precision": metrics.get("precision"),
+                        "recall": metrics.get("recall"),
+                        "f1_score": metrics.get("f1-score"),
+                        "support": metrics.get("support"),
+                    }
+                )
+            else:
+                rows.append(
+                    {
+                        "model": model_name,
+                        "label": label,
+                        "precision": metrics,
+                        "recall": metrics,
+                        "f1_score": metrics,
+                        "support": None,
+                    }
+                )
+
+    pd.DataFrame(rows).to_csv(output_dir / "classification_reports.csv", index=False)
+
+
+def _plot_roc_curves(roc_data: dict[str, dict[str, list[float]]], output_dir: Path) -> None:
+    """Plot ROC curves for all models that produced probabilities."""
+    plt.figure(figsize=(8, 6))
+    plotted = False
+    for name, data in roc_data.items():
+        if not data:
+            continue
+        plt.plot(data["fpr"], data["tpr"], label=f"{name} (AUC={data['roc_auc']:.3f})")
+        plotted = True
+
+    if not plotted:
+        plt.close()
+        return
+
+    plt.plot([0, 1], [0, 1], "k--", label="Random")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curves")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_dir / "roc_curves.png", dpi=200)
+    plt.close()
+
+
+def _plot_confusion_matrix(cm: np.ndarray, output_dir: Path) -> None:
+    """Plot confusion matrix for the ensemble predictions."""
+    fig, ax = plt.subplots(figsize=(4.5, 4.5))
+    im = ax.imshow(cm, cmap="Blues")
+    ax.figure.colorbar(im, ax=ax)
+    ax.set_xticks([0, 1])
+    ax.set_xticklabels(["Not completed", "Completed"])
+    ax.set_yticks([0, 1])
+    ax.set_yticklabels(["Not completed", "Completed"])
+    ax.set_xlabel("Predicted label")
+    ax.set_ylabel("True label")
+
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, cm[i, j], ha="center", va="center", color="black")
+
+    ax.set_title("Ensemble Confusion Matrix")
+    fig.tight_layout()
+    fig.savefig(output_dir / "ensemble_confusion_matrix.png", dpi=200)
+    plt.close(fig)
+
+
+def train_and_eval(
+    data_path: Path,
+    test_size: float | int,
+    random_state: int,
+    save_model: Path | None,
+    output_dir: Path,
+) -> None:
     df = load_dataset(data_path)
     X = df.drop(columns=["label"])
     y = df["label"]
+
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     resolved_test_size, use_stratify = _resolve_test_size(test_size, len(X), y.nunique(), True)
     if resolved_test_size != test_size:
@@ -219,17 +310,31 @@ def train_and_eval(data_path: Path, test_size: float | int, random_state: int, s
     }
 
     trained_pipes: dict[str, Pipeline] = {}
+    reports: dict[str, dict] = {}
+    roc_data: dict[str, dict[str, list[float]]] = {}
+
     for name, estimator in models.items():
         pipe = build_pipeline(estimator)
         pipe.fit(X_train, y_train)
         preds = pipe.predict(X_test)
         proba = pipe.predict_proba(X_test)[:, 1]
         print(f"\n=== {name} ===")
+        report = classification_report(y_test, preds, digits=4, output_dict=True)
         print(classification_report(y_test, preds, digits=4))
         try:
-            print("ROC-AUC:", roc_auc_score(y_test, proba))
+            auc = roc_auc_score(y_test, proba)
+            print("ROC-AUC:", auc)
+            fpr, tpr, _ = roc_curve(y_test, proba)
+            roc_data[name] = {
+                "fpr": fpr.tolist(),
+                "tpr": tpr.tolist(),
+                "roc_auc": auc,
+            }
         except ValueError:
             print("ROC-AUC: cannot compute (needs both classes in y_test).")
+            roc_data[name] = {}
+
+        reports[name] = report
         trained_pipes[name] = pipe
 
     ensemble = VotingClassifier(
@@ -244,10 +349,26 @@ def train_and_eval(data_path: Path, test_size: float | int, random_state: int, s
     ens_proba = ensemble_pipe.predict_proba(X_test)[:, 1]
     print("\n=== soft ensemble ===")
     print(classification_report(y_test, ens_preds, digits=4))
+    ens_report = classification_report(y_test, ens_preds, digits=4, output_dict=True)
+    reports["soft_ensemble"] = ens_report
+
     try:
-        print("ROC-AUC:", roc_auc_score(y_test, ens_proba))
+        ens_auc = roc_auc_score(y_test, ens_proba)
+        print("ROC-AUC:", ens_auc)
+        fpr, tpr, _ = roc_curve(y_test, ens_proba)
+        roc_data["soft_ensemble"] = {
+            "fpr": fpr.tolist(),
+            "tpr": tpr.tolist(),
+            "roc_auc": ens_auc,
+        }
     except ValueError:
         print("ROC-AUC: cannot compute (needs both classes in y_test).")
+        roc_data["soft_ensemble"] = {}
+
+    cm = confusion_matrix(y_test, ens_preds)
+    _save_classification_reports(reports, output_dir)
+    _plot_roc_curves(roc_data, output_dir)
+    _plot_confusion_matrix(cm, output_dir)
 
     if save_model is not None:
         import joblib
@@ -272,12 +393,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional path to persist the fitted ensemble pipeline via joblib.",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("artifacts"),
+        help="Directory where classification reports and plots will be written.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    train_and_eval(args.data, args.test_size, args.random_state, args.save_model)
+    train_and_eval(args.data, args.test_size, args.random_state, args.save_model, args.output_dir)
 
 
 if __name__ == "__main__":
